@@ -1,0 +1,158 @@
+name: Recover public security remediation inputs
+on:
+  workflow_dispatch:
+    inputs:
+      zero_cost_confirmed:
+        description: 'Confirmed zero-overage protection and sufficient free artifact storage'
+        required: true
+        type: boolean
+        default: false
+      max_artifact_mib:
+        description: 'Confirmed free artifact capacity in MiB (maximum 450)'
+        required: true
+        type: number
+        default: 192
+permissions: {}
+concurrency:
+  group: public-security-remediation-inputs
+  cancel-in-progress: false
+jobs:
+  acquire:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.private == false && github.event.repository.fork == false && github.event.repository.name == 'public-go-build-inputs' && github.ref == 'refs/heads/main' && inputs.zero_cost_confirmed == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Acquire checksum-verified public dependency delta
+        shell: bash
+        env:
+          ROOT: ${{ runner.temp }}/public-remediation-inputs
+          CAP: ${{ inputs.max_artifact_mib }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$ROOT"
+          cat > "$ROOT/acquire.py" <<'PY'
+          """Recover only public module inputs; no private application, account, or database access."""
+          import hashlib, json, os, pathlib, shutil, subprocess, tarfile, zipfile
+          from decimal import Decimal
+          P=pathlib.Path
+          ROOT=P(os.environ['ROOT']).resolve()
+          CAP=Decimal(os.environ['CAP'])
+          assert CAP.is_finite() and CAP==CAP.to_integral_value() and 1<=CAP<=450
+          AUTH='387e91f37e00b64b9060352988066bbb685f6e45'
+          TREE='76a236311cfe30815b6b63ed59841d3d6090d5ac'
+          BASE_MOD='cc68eb300c3c95a8bbc0667803685bcd8c4d19e7b9a64cf97a880009a98db514'
+          BASE_SUM='88ef6b4e132c62c79bfe8f90a07a097e56cef22f951947fd64276dc25254544f'
+          PINS={
+              'github.com/crewjam/saml':'v0.5.2',
+              'github.com/gobuffalo/pop/v6':'v6.4.1',
+              'github.com/jackc/pgx/v5':'v5.13.0',
+              'golang.org/x/net':'v0.62.0',
+              'golang.org/x/crypto':'v0.59.0',
+              'google.golang.org/grpc':'v1.83.2',
+              'go.opentelemetry.io/otel/exporters/prometheus':'v0.50.0',
+          }
+          for suffix in ('','/metric','/trace','/sdk','/sdk/metric','/exporters/otlp/otlpmetric/otlpmetricgrpc','/exporters/otlp/otlpmetric/otlpmetrichttp','/exporters/otlp/otlptrace','/exporters/otlp/otlptrace/otlptracegrpc','/exporters/otlp/otlptrace/otlptracehttp'):
+              PINS['go.opentelemetry.io/otel'+suffix]='v1.47.0'
+          def sha(p):
+              with p.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
+          def blob(p):
+              b=p.read_bytes();return hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()
+          def parse(raw):
+              d=json.JSONDecoder();s=raw.decode();out=[]
+              while s.strip():
+                  s=s.lstrip();v,n=d.raw_decode(s);out.append(v);s=s[n:]
+              assert out and all(isinstance(x,dict) and not x.get('Error') for x in out)
+              return out
+          ENV=dict(PATH='/usr/bin:/bin',HOME=str(ROOT/'home'),LANG='C.UTF-8',GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL='/dev/null',GIT_TERMINAL_PROMPT='0',GOTOOLCHAIN='local',GOPROXY='https://proxy.golang.org',GOSUMDB='sum.golang.org',GOPRIVATE='',GONOSUMDB='',GONOPROXY='',GOENV='off',GOWORK='off',GOTELEMETRY='off',CGO_ENABLED='0',GOPATH=str(ROOT/'gopath'),GOMODCACHE=str(ROOT/'gomodcache'),GOCACHE=str(ROOT/'gocache'))
+          def run(args,cwd=ROOT,env=ENV,timeout=1200):
+              print('Running:', ' '.join(map(str,args[:4])),flush=True)
+              r=subprocess.run(list(map(str,args)),cwd=cwd,env=env,check=True,timeout=timeout,stdout=subprocess.PIPE)
+              return r.stdout
+          for name in ('home','src','transfer'):(ROOT/name).mkdir()
+          src=ROOT/'src'; bundle=ROOT/'transfer'; lock=bundle/'resolved-lock'; lock.mkdir()
+          run(['git','init','-q'],src)
+          run(['git','config','core.autocrlf','false'],src)
+          run(['git','fetch','--depth=1','--no-tags','https://github.com/supabase/auth.git',AUTH],src,timeout=300)
+          run(['git','checkout','--detach','FETCH_HEAD'],src)
+          assert run(['git','rev-parse','HEAD'],src).decode().strip()==AUTH
+          assert run(['git','rev-parse','HEAD^{tree}'],src).decode().strip()==TREE
+          assert not run(['git','status','--porcelain','--untracked-files=all'],src).strip()
+          assert blob(src/'go.mod')=='b01958e4361f37cb5ad322099f413d81cf1cff2a'
+          assert blob(src/'go.sum')=='28df74c5eca99e20fe49b6ccf7c7f18186b06fb9'
+          marker=b'\tgithub.com/jackc/pgconn v1.14.3\n'; old=(src/'go.mod').read_bytes()
+          assert old.count(marker)==1
+          (src/'go.mod').write_bytes(old.replace(marker,marker+b'\tgithub.com/jackc/pgx/v5 v5.13.0\n',1))
+          assert blob(src/'go.mod')=='7347a69931df653968c6a134c9dd31a3546119dd'
+          archive=ROOT/'go.tar.gz'
+          run(['curl','--fail','--silent','--show-error','--location','--proto','=https','--proto-redir','=https','--max-time','240','--max-filesize','150000000','--output',archive,'https://go.dev/dl/go1.27.4.linux-amd64.tar.gz'],timeout=250)
+          assert sha(archive)=='7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840'
+          with tarfile.open(archive,'r:gz') as z:z.extractall(ROOT,filter='data')
+          go=ROOT/'go/bin/go';ENV['GOROOT']=str(ROOT/'go')
+          assert run([go,'version']).decode().strip()=='go version go1.27.4 linux/amd64'
+          def resolve():
+              parse(run([go,'mod','download','-json','all'],src))
+              graph=run([go,'list','-mod=mod','-m','-json','all'],src)
+              downloads=run([go,'mod','download','-json','all'],src)
+              parse(downloads)
+              assert run([go,'mod','verify'],src).decode().strip()=='all modules verified'
+              return graph,downloads
+          resolve()
+          assert sha(src/'go.mod')==BASE_MOD and sha(src/'go.sum')==BASE_SUM, 'Previous public dependency locks did not reproduce'
+          cache=P(ENV['GOMODCACHE'])/'cache/download'
+          base={x.relative_to(cache).as_posix():sha(x) for x in cache.rglob('*.zip') if x.is_file() and not x.is_symlink()}
+          assert len(base)>100
+          for mod,ver in sorted(PINS.items()):run([go,'mod','edit','-require='+mod+'@'+ver],src)
+          graph,downloads=resolve()
+          selected={x['Path']:x.get('Version') for x in parse(graph)}
+          assert all(selected.get(k)==v for k,v in PINS.items()), 'A pinned release was not selected; inspect graph, do not force a downgrade'
+          records={(x['Path'],x.get('Version')):x for x in parse(downloads)}
+          sums=set((src/'go.sum').read_text().splitlines())
+          for mod,ver in PINS.items():
+              x=records[(mod,ver)];assert x['Sum'].startswith('h1:') and x['GoModSum'].startswith('h1:')
+              assert f'{mod} {ver} {x["Sum"]}' in sums and f'{mod} {ver}/go.mod {x["GoModSum"]}' in sums
+          for n in ('go.mod','go.sum'):shutil.copyfile(src/n,lock/n)
+          (lock/'module-graph.json-stream').write_bytes(graph);(lock/'module-download.json-stream').write_bytes(downloads)
+          (lock/'pins.json').write_text(json.dumps(PINS,indent=2,sort_keys=True)+'\n')
+          omitted={};delta=bundle/'gomodcache/cache/download'
+          for x in sorted(cache.rglob('*')):
+              if x.is_dir():continue
+              assert x.is_file() and not x.is_symlink()
+              rel=x.relative_to(cache).as_posix()
+              if rel.endswith('.lock'):continue
+              if rel.endswith('.zip') and rel in base and sha(x)==base[rel]:omitted[rel]=base[rel];continue
+              out=delta/rel;out.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(x,out)
+          assert omitted
+          (bundle/'omitted-baseline-zips.json').write_text(json.dumps(omitted,sort_keys=True)+'\n')
+          sumdb=P(ENV['GOPATH'])/'pkg/sumdb'
+          if sumdb.exists():shutil.copytree(sumdb,bundle/'gopath/pkg/sumdb')
+          # Reconstruct from the same immutable baseline ZIPs and actual delta in a fresh cache.
+          off=ROOT/'offline';shutil.copytree(src,off/'src',ignore=shutil.ignore_patterns('.git'))
+          oc=off/'gomodcache/cache/download';shutil.copytree(delta,oc)
+          for rel,h in omitted.items():
+              target=oc/rel;target.parent.mkdir(parents=True,exist_ok=True)
+              shutil.copyfile(cache/rel,target);assert sha(target)==h
+          if (bundle/'gopath').exists():shutil.copytree(bundle/'gopath',off/'gopath')
+          oe=dict(ENV,GOPROXY='off',GOMODCACHE=str(off/'gomodcache'),GOPATH=str(off/'gopath'),GOCACHE=str(off/'gocache'))
+          parse(run([go,'mod','download','-json','all'],off/'src',oe))
+          assert run([go,'mod','verify'],off/'src',oe).decode().strip()=='all modules verified'
+          assert all((off/'src'/n).read_bytes()==(lock/n).read_bytes() for n in ('go.mod','go.sum'))
+          receipt=dict(scope='Public dependency delta acquisition only, not application compilation or vulnerability remediation',authCommit=AUTH,authTree=TREE,baseGoModSHA256=BASE_MOD,baseGoSumSHA256=BASE_SUM,pins=PINS,checksumDatabase='sum.golang.org',offlineCacheVerified=True,omittedBaselineZipCount=len(omitted),resolvedGoModSHA256=sha(lock/'go.mod'),resolvedGoSumSHA256=sha(lock/'go.sum'),privateCodeTransferred=False,hostedDatabaseAccess=False,actualApplicationCompiled=False)
+          (bundle/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+          final=ROOT/'public-remediation-inputs.zip'
+          with zipfile.ZipFile(final,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for x in sorted(bundle.rglob('*')):
+                  if x.is_dir():continue
+                  assert x.is_file() and not x.is_symlink();z.write(x,x.relative_to(bundle).as_posix())
+          assert final.stat().st_size<=int(CAP)*1024*1024-1024*1024, 'Artifact cap exceeded; upload denied'
+          print('Public delta bytes:',final.stat().st_size,'SHA-256:',sha(final),flush=True)
+          PY
+          python3 "$ROOT/acquire.py"
+      - name: Retain verified public dependency delta for one day
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: public-remediation-inputs
+          path: ${{ runner.temp }}/public-remediation-inputs/public-remediation-inputs.zip
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
