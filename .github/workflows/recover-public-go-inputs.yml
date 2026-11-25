@@ -1,0 +1,285 @@
+# Standalone, public-source-only input recovery. Do not install in an existing private or support repo.
+name: Recover public Go build inputs
+on:
+  workflow_dispatch:
+    inputs:
+      zero_cost_confirmed:
+        description: "Confirmed zero-overage protection covers Actions and artifact storage"
+        required: true
+        type: boolean
+        default: false
+      max_artifact_mib:
+        description: "Maximum artifact size (MiB), within confirmed no-charge capacity"
+        required: true
+        type: number
+        default: 450
+permissions: {}
+concurrency:
+  group: public-go-input-acquisition
+  cancel-in-progress: false
+jobs:
+  acquire:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.private == false && github.event.repository.fork == false && github.event.repository.name == 'public-go-build-inputs' && github.ref == 'refs/heads/main' && inputs.zero_cost_confirmed == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TRANSFER_DIR: ${{ runner.temp }}/public-go-input-transfer
+    steps:
+      - name: Acquire and verify exact public sources and modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$TRANSFER_DIR"
+          cat > "$RUNNER_TEMP/acquire_public_go_inputs.py" <<'PUBLIC_GO_INPUTS_PY'
+          """Acquire public Go build inputs in an interactive, network-enabled Linux AMD64 session.
+          No private application source, account credentials, deployment or database access required.
+          """
+          import hashlib
+          import json
+          import os
+          import platform
+          import shutil
+          import ssl
+          import stat
+          import subprocess
+          import tarfile
+          import tempfile
+          import urllib.request
+          from pathlib import Path
+          
+          GO_VERSION = '1.27.4'
+          GO_URL = 'https://go.dev/dl/go1.27.4.linux-amd64.tar.gz'
+          GO_SHA = '7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840'
+          SCOPE = 'Exact upstream Git object metadata for offline checkout verification only; not recovered source or Go module checksum verification.'
+          SPECS = [
+              dict(name='gotrue-v2.198.0', repo='supabase/auth', commit='387e91f37e00b64b9060352988066bbb685f6e45', tree='76a236311cfe30815b6b63ed59841d3d6090d5ac', count=554, size=3992032, manifest='ec9381e3c8537b0bbf4694c9590644695d7bddaa'),
+              dict(name='pgx-v5.13.0', repo='jackc/pgx', commit='1e38d71d74e94fd3b35cbe5b3415109a870d5b91', tree='23067ab97409b810bef4c63e599a99fc01fd219d', count=408, size=2850824, manifest='91698cedfb4c0c35612e4d46c137a556a28daf02'),
+          ]
+          ORIGINAL_GO_MOD = 'b01958e4361f37cb5ad322099f413d81cf1cff2a'
+          ORIGINAL_GO_SUM = '28df74c5eca99e20fe49b6ccf7c7f18186b06fb9'
+          OVERLAY_GO_MOD = '7347a69931df653968c6a134c9dd31a3546119dd'
+          PGX_MODULE = 'github.com/jackc/pgx/v5'
+          PGX_VERSION = 'v5.13.0'
+          
+          
+          def digest(path):
+              with Path(path).open('rb') as f:
+                  return hashlib.file_digest(f, 'sha256').hexdigest()
+          
+          
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          
+          
+          def need(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+          
+          
+          def run(args, cwd, env, timeout=300):
+              print('Running:', ' '.join(str(x) for x in args[:3]), flush=True)
+              return subprocess.check_output([str(x) for x in args], cwd=cwd, env=env, timeout=timeout)
+          
+          
+          def canonical_inventory(repo, spec, env):
+              git = lambda *a: run(['git', *a], repo, env)
+              need(git('rev-parse','HEAD').decode().strip() == spec['commit'], 'Wrong upstream commit')
+              need(git('rev-parse','HEAD^{tree}').decode().strip() == spec['tree'], 'Wrong upstream tree')
+              need(not git('status','--porcelain','--untracked-files=all').strip(), 'Upstream checkout not clean')
+              entries = []
+              for record in git('ls-tree','-r','-l','-z','HEAD').split(b'\0'):
+                  if not record:
+                      continue
+                  meta, name = record.split(b'\t',1)
+                  mode, typ, sha, length = meta.decode('ascii').split()
+                  name = name.decode('ascii')
+                  path = repo / name
+                  need(typ == 'blob' and mode in ('100644','100755'), 'Unexpected upstream file kind')
+                  need(path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(repo.resolve()), 'Invalid checkout path')
+                  data = path.read_bytes()
+                  need(len(data) == int(length) and blob(data) == sha, 'Upstream checkout blob mismatch: '+name)
+                  need(bool(path.stat().st_mode & stat.S_IXUSR) == (mode == '100755'), 'File mode mismatch: '+name)
+                  entries.append([name,mode,sha,int(length)])
+              entries.sort(key=lambda e:e[0])
+              need(len(entries) == spec['count'] and sum(e[3] for e in entries) == spec['size'], 'Upstream inventory count or size mismatch')
+              inv = dict(scope=SCOPE,repository=spec['repo'],commit=spec['commit'],rootTree=spec['tree'],blobCount=len(entries),totalBytes=sum(e[3] for e in entries),columns=['path','mode','gitBlobSHA1','byteCount'],entries=entries)
+              raw = (json.dumps(inv,separators=(',',':'),ensure_ascii=False)+'\n').encode()
+              need(blob(raw) == spec['manifest'], 'Published exact inventory Git blob mismatch')
+              return raw
+          
+          
+          def json_stream(raw):
+              data = raw.decode('utf-8')
+              decoder = json.JSONDecoder()
+              i = 0
+              result = []
+              while i < len(data):
+                  while i < len(data) and data[i].isspace():
+                      i += 1
+                  if i == len(data):
+                      break
+                  obj, i = decoder.raw_decode(data,i)
+                  result.append(obj)
+              need(result and all(isinstance(x,dict) and not x.get('Error') for x in result), 'Go module download reported an error')
+              return result
+          
+          
+          def verify_pgx(records, source_dir):
+              rows = [x for x in records if x.get('Path') == PGX_MODULE and x.get('Version') == PGX_VERSION]
+              need(len(rows)==1 and rows[0].get('Sum','').startswith('h1:') and rows[0].get('GoModSum','').startswith('h1:'), 'Missing verified pgx module checksum')
+              row = rows[0]
+              sums = (source_dir/'go.sum').read_text().splitlines()
+              need(f"{PGX_MODULE} {PGX_VERSION} {row['Sum']}" in sums, 'pgx source checksum missing in resolved go.sum')
+              need(f"{PGX_MODULE} {PGX_VERSION}/go.mod {row['GoModSum']}" in sums, 'pgx go.mod checksum missing in resolved go.sum')
+              return {'path':PGX_MODULE,'version':PGX_VERSION,'sum':row['Sum'],'goModSum':row['GoModSum']}
+          
+          
+          def acquire(output_dir):
+              need(platform.system()=='Linux' and platform.machine() in ('x86_64','AMD64'), 'Select a Linux AMD64 CPU runtime')
+              need(hasattr(tarfile,'data_filter'), 'Python tar data filtering required')
+              out = Path(output_dir).resolve()
+              out.mkdir(parents=True,exist_ok=True)
+              with tempfile.TemporaryDirectory(prefix='public-go-inputs-',dir=out) as td:
+                  root=Path(td)
+                  bundle=root/'transfer';bundle.mkdir()
+                  home=root/'home';home.mkdir()
+                  env=dict(PATH=os.environ.get('PATH','/usr/bin:/bin'),HOME=str(home),LANG='C.UTF-8',GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL='/dev/null',GIT_TERMINAL_PROMPT='0',GOTOOLCHAIN='local',GOPROXY='https://proxy.golang.org',GOSUMDB='sum.golang.org',GOPRIVATE='',GONOSUMDB='',GONOPROXY='',GOENV='off',GOWORK='off',GOPATH=str(root/'gopath'),GOMODCACHE=str(root/'gomodcache'),GOCACHE=str(root/'gocache'))
+                  inventories=bundle/'inventories';inventories.mkdir()
+                  for spec in SPECS:
+                      repo=bundle/spec['name'];repo.mkdir()
+                      run(['git','init','-q'],repo,env)
+                      run(['git','config','core.autocrlf','false'],repo,env)
+                      run(['git','config','core.filemode','true'],repo,env)
+                      run(['git','fetch','--depth=1','--no-tags','https://github.com/'+spec['repo']+'.git',spec['commit']],repo,env,300)
+                      run(['git','checkout','--detach','FETCH_HEAD'],repo,env,120)
+                      raw=canonical_inventory(repo,spec,env)
+                      (inventories/(spec['name']+'.json')).write_bytes(raw)
+                      print('Verified every source blob and published inventory:',spec['name'],flush=True)
+                  upstream=bundle/SPECS[0]['name']
+                  need(blob((upstream/'go.mod').read_bytes())==ORIGINAL_GO_MOD and blob((upstream/'go.sum').read_bytes())==ORIGINAL_GO_SUM,'Unexpected original Go module locks')
+                  resolved=root/'resolve';shutil.copytree(upstream,resolved,ignore=shutil.ignore_patterns('.git'))
+                  old=(resolved/'go.mod').read_bytes();marker=b'\tgithub.com/jackc/pgconn v1.14.3\n'
+                  need(old.count(marker)==1,'Unexpected module insertion anchor')
+                  new=old.replace(marker,marker+b'\tgithub.com/jackc/pgx/v5 v5.13.0\n',1)
+                  need(blob(new)==OVERLAY_GO_MOD,'Dependency overlay does not match existing experiment')
+                  (resolved/'go.mod').write_bytes(new)
+                  print('Downloading official Go distribution with HTTPS and pinned SHA-256',flush=True)
+                  archive=root/'go.tar.gz'
+                  with urllib.request.urlopen(GO_URL,context=ssl.create_default_context(),timeout=90) as response, archive.open('wb') as target:
+                      need(response.geturl().startswith('https://'),'Non-HTTPS toolchain redirect')
+                      shutil.copyfileobj(response,target)
+                  need(digest(archive)==GO_SHA,'Official Go archive checksum mismatch')
+                  with tarfile.open(archive,'r:gz') as tar:
+                      tar.extractall(root,filter='data')
+                  go=root/'go/bin/go';env['GOROOT']=str(root/'go')
+                  need(run([go,'version'],root,env).decode().strip()==f'go version go{GO_VERSION} linux/amd64','Toolchain version mismatch')
+                  print('Resolving public dependency graph using Go checksum verification',flush=True)
+                  downloads=run([go,'mod','download','-json','all'],resolved,env,1200)
+                  records=json_stream(downloads)
+                  # Resolve the graph, then ensure the complete build-list download exists.
+                  graph=run([go,'list','-mod=mod','-m','-json','all'],resolved,env,600)
+                  downloads=run([go,'mod','download','-json','all'],resolved,env,1200)
+                  records=json_stream(downloads)
+                  pgx=verify_pgx(records,resolved)
+                  verified=run([go,'mod','verify'],resolved,env,600).decode().strip()
+                  need(verified=='all modules verified','Go module verification did not pass')
+                  lock=bundle/'resolved-lock';lock.mkdir()
+                  for name in ('go.mod','go.sum'):
+                      shutil.copyfile(resolved/name,lock/name)
+                  (lock/'module-graph.json-stream').write_bytes(graph)
+                  (lock/'module-download.json-stream').write_bytes(downloads)
+                  (lock/'go-mod-verify.txt').write_text(verified+'\n')
+                  (lock/'pgx-checksums.json').write_text(json.dumps(pgx,indent=2)+'\n')
+                  # Transfer only the public download cache rather than duplicate expanded modules.
+                  cache=bundle/'gomodcache'/'cache'/'download';cache.parent.mkdir(parents=True)
+                  shutil.copytree(Path(env['GOMODCACHE'])/'cache'/'download',cache)
+                  sumdb=Path(env['GOPATH'])/'pkg'/'sumdb'
+                  if sumdb.exists():
+                      dest=bundle/'gopath'/'pkg'/'sumdb';dest.parent.mkdir(parents=True,exist_ok=True);shutil.copytree(sumdb,dest)
+                  # Verify that this exact compact cache can reconstruct all modules without public DNS.
+                  offline=root/'offline-resolve';shutil.copytree(resolved,offline)
+                  offline_cache=root/'offline-cache';shutil.copytree(bundle/'gomodcache',offline_cache)
+                  offline_gp=root/'offline-gopath';offline_gp.mkdir()
+                  if (bundle/'gopath').exists():
+                      shutil.copytree(bundle/'gopath',offline_gp,dirs_exist_ok=True)
+                  oe=dict(env,GOPROXY='off',GOMODCACHE=str(offline_cache),GOPATH=str(offline_gp),GOCACHE=str(root/'offline-gocache'))
+                  print('Testing offline reconstruction with checksum database still enabled',flush=True)
+                  offline_records=json_stream(run([go,'mod','download','-json','all'],offline,oe,1200))
+                  need(verify_pgx(offline_records,offline)==pgx,'Offline pgx checksum mismatch')
+                  need(run([go,'mod','verify'],offline,oe,600).decode().strip()=='all modules verified','Offline module verification failed')
+                  need((offline/'go.mod').read_bytes()==(lock/'go.mod').read_bytes() and (offline/'go.sum').read_bytes()==(lock/'go.sum').read_bytes(),'Offline lock changed')
+                  receipt=dict(scope='Public source and Go module acquisition only; NOT GoTrue binary, migration or hosted acceptance',sourceInventoriesVerified=[s['name'] for s in SPECS],goVersion=GO_VERSION,officialGoSHA256=GO_SHA,initialOverlayGoModBlob=OVERLAY_GO_MOD,pgx=pgx,moduleCount=len(records),goModSHA256=digest(lock/'go.mod'),goSumSHA256=digest(lock/'go.sum'),checksumDatabase='sum.golang.org',offlineCacheVerified=True,privateRepositoryAccess=False,hostedDatabaseAccess=False,privateCodeTransferred=False,actualExperimentalBinaryCompiled=False)
+                  (bundle/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+                  final=out/'Public_GoTrue_Go_Module_Inputs.zip'
+                  need(not final.exists(),'Existing output would be overwritten; choose another output directory')
+                  shutil.make_archive(str(final.with_suffix('')),'zip',root_dir=bundle)
+                  print('Transfer bundle SHA-256:',digest(final),flush=True)
+                  print('Transfer bundle bytes:',final.stat().st_size,flush=True)
+                  return final
+          
+          
+          if __name__=='__main__':
+              import argparse
+              parser=argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('--output-dir',type=Path,required=True)
+              print(acquire(parser.parse_args().output_dir))
+          PUBLIC_GO_INPUTS_PY
+          printf '%s  %s\n' '377ac97e9827c58614731069e0015f5a11d6e0cf38ff32a120d7e7b4dd6a7e35' "$RUNNER_TEMP/acquire_public_go_inputs.py" | sha256sum -c -
+          python3 "$RUNNER_TEMP/acquire_public_go_inputs.py" --output-dir "$TRANSFER_DIR"
+      - name: Verify transfer receipt and enforce confirmed storage cap
+        shell: bash
+        env:
+          MAX_ARTIFACT_MIB: ${{ inputs.max_artifact_mib }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PUBLIC_TRANSFER_CHECK_PY'
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from decimal import Decimal, InvalidOperation
+          from pathlib import Path
+          
+          try:
+              limit = Decimal(os.environ['MAX_ARTIFACT_MIB'])
+              if not limit.is_finite() or limit != limit.to_integral_value() or not 1 <= limit <= 2048:
+                  raise ValueError('Artifact cap must be an integer between 1 and 2048 MiB.')
+          except (InvalidOperation, KeyError) as exc:
+              raise ValueError('Invalid artifact cap.') from exc
+          path = Path(os.environ['TRANSFER_DIR']) / 'Public_GoTrue_Go_Module_Inputs.zip'
+          size = path.stat().st_size
+          # Reserve 1 MiB for the enclosing Actions artifact and ZIP metadata.
+          if size == 0 or size + 1048576 > int(limit) * 1048576:
+              raise RuntimeError(f'Artifact exceeds confirmed size cap ({size} bytes). Nothing will be uploaded.')
+          with zipfile.ZipFile(path) as z:
+              expected_roots = {'gotrue-v2.198.0', 'pgx-v5.13.0', 'inventories', 'resolved-lock', 'gomodcache', 'gopath', 'receipt.json'}
+              if any(n.split('/')[0] not in expected_roots for n in z.namelist()):
+                  raise RuntimeError('Unexpected transfer archive content.')
+              receipt = json.loads(z.read('receipt.json'))
+              if (receipt.get('goVersion') != '1.27.4' or
+                  receipt.get('sourceInventoriesVerified') != ['gotrue-v2.198.0', 'pgx-v5.13.0'] or
+                  receipt.get('checksumDatabase') != 'sum.golang.org' or
+                  receipt.get('offlineCacheVerified') is not True or
+                  receipt.get('privateRepositoryAccess') is not False or
+                  receipt.get('hostedDatabaseAccess') is not False or
+                  receipt.get('privateCodeTransferred') is not False or
+                  receipt.get('actualExperimentalBinaryCompiled') is not False or
+                  receipt.get('pgx', {}).get('version') != 'v5.13.0'):
+                  raise RuntimeError('Public input acquisition receipt is incomplete or inconsistent.')
+          with path.open('rb') as stream:
+              sha = hashlib.file_digest(stream, 'sha256').hexdigest()
+          print(f'Public transfer ZIP: {size} bytes, SHA-256 {sha}')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(f'## Public build inputs verified\n\n- Transfer ZIP: `{size}` bytes\n- SHA-256: `{sha}`\n- Scope: public dependencies only; not an application build or deployment.\n')
+          PUBLIC_TRANSFER_CHECK_PY
+      - name: Retain the verified public inputs for one day
+        id: artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: public-go-build-inputs
+          path: ${{ runner.temp }}/public-go-input-transfer/Public_GoTrue_Go_Module_Inputs.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+          overwrite: false
