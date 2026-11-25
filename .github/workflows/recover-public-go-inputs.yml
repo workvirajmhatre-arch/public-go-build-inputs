@@ -22,11 +22,11 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.private == false && github.event.repository.fork == false && github.event.repository.name == 'public-go-build-inputs' && github.ref == 'refs/heads/main' && inputs.zero_cost_confirmed == true }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      TRANSFER_DIR: ${{ runner.temp }}/public-go-input-transfer
     steps:
       - name: Acquire and verify exact public sources and modules
         shell: bash
+        env:
+          TRANSFER_DIR: ${{ runner.temp }}/public-go-input-transfer
         run: |
           set -euo pipefail
           umask 077
@@ -230,6 +230,7 @@ jobs:
       - name: Verify transfer receipt and enforce confirmed storage cap
         shell: bash
         env:
+          TRANSFER_DIR: ${{ runner.temp }}/public-go-input-transfer
           MAX_ARTIFACT_MIB: ${{ inputs.max_artifact_mib }}
         run: |
           set -euo pipefail
