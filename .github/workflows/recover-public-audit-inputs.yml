@@ -1,0 +1,89 @@
+name: Recover official baseline and vulnerability inputs
+
+on:
+  workflow_dispatch:
+    inputs:
+      zero_cost_confirmed:
+        description: 'Confirmed zero-overage protection and free artifact storage capacity'
+        required: true
+        type: boolean
+        default: false
+      max_artifact_mib:
+        description: 'Confirmed available artifact capacity in MiB (maximum 96)'
+        required: true
+        type: number
+        default: 96
+permissions: {}
+concurrency:
+  group: public-audit-input-acquisition
+  cancel-in-progress: false
+jobs:
+  acquire:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.private == false && github.event.repository.fork == false && github.event.repository.name == 'public-go-build-inputs' && github.ref == 'refs/heads/main' && inputs.zero_cost_confirmed == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Acquire public audit inputs only
+        shell: bash
+        env:
+          ROOT: ${{ runner.temp }}/public-audit-inputs
+          CAP: ${{ inputs.max_artifact_mib }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$CAP" =~ ^[0-9]+$ ]] && (( CAP >= 1 && CAP <= 96 ))
+          mkdir -p "$ROOT"/{out,go-cache,go-mod,home,bin}
+          cd "$ROOT"
+          fetch() {
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 240 --max-filesize "$3" --output "$2" "$1"
+          }
+          fetch 'https://github.com/supabase/auth/releases/download/v2.198.0/auth-v2.198.0-amd64.tar.xz' out/auth-v2.198.0-amd64.tar.xz 9940848
+          printf '%s  %s\n' '4abe9134d7615faa9149cab514acada8e7133cd69d2ccd96fdcef0d795c05171' out/auth-v2.198.0-amd64.tar.xz | sha256sum -c -
+          test "$(stat -c %s out/auth-v2.198.0-amd64.tar.xz)" = 9940848
+          fetch 'https://go.dev/dl/go1.27.4.linux-amd64.tar.gz' go.tar.gz 150000000
+          printf '%s  %s\n' '7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840' go.tar.gz | sha256sum -c -
+          tar -xzf go.tar.gz
+          export PATH="$ROOT/go/bin:/usr/bin:/bin"
+          export GOROOT="$ROOT/go" GOBIN="$ROOT/bin" GOCACHE="$ROOT/go-cache" GOMODCACHE="$ROOT/go-mod" HOME="$ROOT/home"
+          export GOENV=off GOWORK=off GOTOOLCHAIN=local GOTELEMETRY=off CGO_ENABLED=0 GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOPRIVATE='' GONOSUMDB='' GONOPROXY=''
+          go version | tee out/toolchain.txt
+          grep -Fx 'go version go1.27.4 linux/amd64' out/toolchain.txt
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          go version -m bin/govulncheck > out/scanner-modules.txt
+          grep -F 'golang.org/x/vuln' out/scanner-modules.txt
+          grep -F 'v1.10.0' out/scanner-modules.txt
+          cp bin/govulncheck out/govulncheck-linux-amd64
+          fetch 'https://vuln.go.dev/vulndb.zip' out/vulndb.zip 75000000
+          python3 - <<'PY'
+          import json, pathlib, zipfile
+          p=pathlib.Path('out/vulndb.zip')
+          with zipfile.ZipFile(p) as z:
+              files=z.infolist()
+              assert len(files) > 100
+              assert sum(x.file_size for x in files) < 1000000000
+              assert all(not pathlib.PurePosixPath(x.filename).is_absolute() and '..' not in pathlib.PurePosixPath(x.filename).parts for x in files)
+              assert z.testzip() is None
+              assert any(x.filename.endswith('index/modules.json') for x in files)
+              pathlib.Path('out/db-inventory.json').write_text(json.dumps({'entries': len(files), 'uncompressed_bytes':sum(x.file_size for x in files)}, indent=2))
+          PY
+          date -u +%FT%TZ > out/retrieved-at-utc.txt
+          (cd out && sha256sum * > SHA256SUMS.txt)
+          # Archive only these explicitly collected public assets. Never include repository files, credentials, or candidate binaries.
+          python3 - <<'PY'
+          import os, pathlib, zipfile
+          root=pathlib.Path('.')
+          with zipfile.ZipFile('public-audit-inputs.zip','w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in sorted((root/'out').iterdir()):
+                  assert p.is_file() and not p.is_symlink()
+                  z.write(p,p.name)
+          cap=int(os.environ['CAP'])*1024*1024
+          assert pathlib.Path('public-audit-inputs.zip').stat().st_size <= cap-1024*1024, 'Artifact cap exceeded: do not upload'
+          PY
+      - name: Preserve public audit inputs briefly
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: public-audit-inputs
+          path: ${{ runner.temp }}/public-audit-inputs/public-audit-inputs.zip
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
